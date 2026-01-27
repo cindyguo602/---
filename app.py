@@ -12,13 +12,12 @@ SHEET_NAME = 'work_log'
 
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "1234"
+ADMIN_PASSWORD = "345678"
 
 # --- 連接 Google Sheets 的函式 ---
 def get_google_sheet_client():
     # 從 Streamlit Cloud 的 Secrets 裡讀取憑證
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    # 這裡會讀取我們等一下在網頁上設定的 secrets
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
@@ -31,16 +30,13 @@ def load_data():
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
-        # 如果是空的，建立欄位
         if df.empty:
             return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
             
-        # 轉換時間格式
         if 'Time' in df.columns:
             df['Time'] = pd.to_datetime(df['Time'])
         return df
     except Exception as e:
-        # 如果找不到檔案或連線失敗
         st.error(f"無法讀取 Google Sheet: {e}")
         return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
 
@@ -49,21 +45,17 @@ def save_data(df):
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
         
-        # 因為 gspread 寫入需要字串，先把時間轉回字串
+        # 轉換時間格式為字串，Google Sheet 才看得懂
         save_df = df.copy()
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
-        # 全量更新 (簡單暴力，適合小團隊資料量)
+        # 清空舊資料，寫入新資料 (這是最穩的做法)
         sheet.clear()
-        # 把欄位名稱寫回去
         sheet.append_row(save_df.columns.tolist())
-        # 把資料寫回去
         sheet.append_rows(save_df.values.tolist())
         
     except Exception as e:
         st.error(f"存檔失敗: {e}")
-
-# --- 以下邏輯與原本相同，僅省略部分重複註解 ---
 
 def recalculate_timestamp(df):
     try:
@@ -157,7 +149,7 @@ if 'show_balloons' in st.session_state and st.session_state['show_balloons']:
     st.toast('打卡成功！', icon='✅')
     st.session_state['show_balloons'] = False
 
-df = load_data() # 改成讀取 Google Sheet
+df = load_data()
 
 # --- Sidebar ---
 st.sidebar.header("📍 打卡區")
@@ -203,7 +195,7 @@ st.sidebar.info(f"💰 時薪: ${BASE_RATE}\n📉 預算: ${BUDGET_LIMIT/10000}�
 records_df, scheme_stats_df = calculate_salary_stats(df)
 t1, t2, t3 = st.tabs(["💰 個人報表", "📊 專案監控", "🔧 後台管理"])
 
-with t1: # 個人
+with t1:
     if final_name and not records_df.empty:
         my_recs = records_df[records_df['Name']==final_name].copy()
         if not my_recs.empty:
@@ -229,7 +221,7 @@ with t1: # 個人
         else: st.info("無紀錄")
     else: st.info("請選擇名字")
 
-with t2: # 監控
+with t2:
     if not scheme_stats_df.empty:
         sel = st.radio("篩選", ["全部", "方案1", "方案2", "方案3"], horizontal=True)
         tgt = scheme_stats_df if sel=="全部" else scheme_stats_df[scheme_stats_df['Scheme']==sel]
@@ -240,10 +232,12 @@ with t2: # 監控
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
             st.divider()
 
-with t3: # 後台
+with t3:
     pwd = st.text_input("密碼", type="password")
     if pwd == ADMIN_PASSWORD:
         st.success("已解鎖")
+        
+        # --- 1. 即時監控 ---
         st.markdown("### 🟢 線上人員")
         if not records_df.empty:
             w_df = records_df[records_df['Status']=='Working'].copy()
@@ -253,11 +247,65 @@ with t3: # 後台
                 w_df['打卡'] = w_df['Time_In'].dt.strftime('%H:%M')
                 st.dataframe(w_df[['Name','Scheme','打卡','時數']], use_container_width=True, hide_index=True)
             else: st.info("無人上班")
+        st.divider()
+
+        # --- 2. Google 同步編輯器 ---
+        st.markdown("### 📋 資料編輯 (將同步至 Google Sheet)")
         
-        st.markdown("### 📋 資料編輯")
-        # 這裡簡化編輯器，因為 Google Sheet 同步比較慢，建議只做簡單顯示
-        # 若要編輯，直接去 Google Sheet 改最快！
-        st.info("💡 如需修改歷史資料，請直接打開 Google 試算表進行編輯，這裡僅供檢視。")
-        st.link_button("前往 Google 試算表", f"https://docs.google.com/spreadsheets/d/") # 你可以填入網址
+        col_filter1, col_filter2 = st.columns(2)
+        all_names = sorted(df['Name'].unique().tolist()) if not df.empty else []
+        all_schemes = ["方案1", "方案2", "方案3"]
         
-        st.dataframe(df.sort_values('Time', ascending=False), use_container_width=True)
+        with col_filter1:
+            st.markdown("##### 1. 日期範圍")
+            c_d1, c_d2 = st.columns(2)
+            start_date = c_d1.date_input("開始", date(2024, 1, 1))
+            end_date = c_d2.date_input("結束", date.today())
+
+        with col_filter2:
+            st.markdown("##### 2. 詳細篩選")
+            c_f1, c_f2 = st.columns(2)
+            filter_names = c_f1.multiselect("篩選人員", options=all_names, placeholder="留空則顯示全部")
+            filter_schemes = c_f2.multiselect("篩選方案", options=all_schemes, placeholder="留空則顯示全部")
+
+        # 篩選邏輯
+        mask = (df['Time'].dt.date >= start_date) & (df['Time'].dt.date <= end_date)
+        if filter_names: mask = mask & (df['Name'].isin(filter_names))
+        if filter_schemes: mask = mask & (df['Scheme'].isin(filter_schemes))
+            
+        filtered_df = df.loc[mask].copy()
+        if not filtered_df.empty:
+            filtered_df = filtered_df.sort_values(by=['Time', 'Name', 'Scheme'], ascending=[False, True, True])
+
+        # 編輯器
+        edited_df = st.data_editor(
+            filtered_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Name": st.column_config.SelectboxColumn("姓名", options=all_names + ["新增..."], required=True),
+                "Scheme": st.column_config.SelectboxColumn("方案", options=all_schemes, required=True),
+                "Action": st.column_config.SelectboxColumn("動作", options=["上班", "下班"], required=True),
+                "Time": st.column_config.DatetimeColumn("打卡時間", format="Y-M-D HH:mm:ss", step=60),
+                "Timestamp": st.column_config.NumberColumn("系統秒數", disabled=True)
+            },
+            key="admin_editor"
+        )
+
+        if st.button("💾 儲存並同步至 Google Sheet", type="primary"):
+            with st.spinner("正在寫入 Google Sheet，請稍候..."):
+                # 1. 取得沒被篩選到的舊資料
+                remaining_df = df.loc[~mask]
+                # 2. 合併編輯後的資料
+                new_full_df = pd.concat([remaining_df, edited_df], ignore_index=True)
+                # 3. 重新計算 Timestamp (防止手動改時間沒改到秒數)
+                new_full_df, success = recalculate_timestamp(new_full_df)
+                
+                if success:
+                    # 4. 寫入 Google
+                    save_data(new_full_df)
+                    st.success("✅ 資料已成功同步！")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ 時間格式錯誤！")
