@@ -103,7 +103,7 @@ def check_cooldown(df, name, cooldown_seconds=10):
 def calculate_salary_stats(df):
     if df.empty: return pd.DataFrame(), pd.DataFrame()
     records = []
-    # 確保資料依照時間排序，這樣計算上班下班才不會錯亂
+    # 確保資料依照時間排序
     df = df.sort_values('Timestamp')
     
     for (name, scheme), group in df.groupby(['Name', 'Scheme']):
@@ -115,7 +115,7 @@ def calculate_salary_stats(df):
                 end_time = row['Timestamp']
                 duration_seconds = end_time - start_time
                 
-                # 只有大於 0 的才算有效工時 (避免手動改時間改錯)
+                # 只有大於 0 的才算有效工時
                 if duration_seconds > 0:
                     minutes = math.ceil(duration_seconds / 60)
                     hours = minutes / 60.0
@@ -161,7 +161,6 @@ def calculate_salary_stats(df):
     return records_df, pd.DataFrame(scheme_stats)
 
 def get_greeting():
-    # 改用台灣時間
     h = get_taiwan_now().hour
     return "早安 ☀️" if 5<=h<12 else "午安 ☕" if 12<=h<18 else "晚安 🌙"
 
@@ -230,7 +229,6 @@ with t1:
             c1.metric("累計薪資", f"${my_recs['Earnings'].sum():,.0f}")
             c2.metric("結算工時", f"{my_recs[my_recs['Status']=='Done']['Hours'].sum():.2f} hr")
             
-            # 使用 if-else 避免亂碼
             if is_work:
                 c3.success("🟢 工作中")
             else:
@@ -263,6 +261,19 @@ with t2:
             c1.markdown(f"### {r['Scheme']}")
             c2.markdown(f"時薪: **${r['Current_Rate']:.2f}**")
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
+            
+            # --- [新增] 查看人員明細功能 ---
+            with st.expander(f"📋 查看 {r['Scheme']} 人員薪資詳情"):
+                if not records_df.empty:
+                    # 篩選出這個方案且已結算的紀錄
+                    scheme_details = records_df[(records_df['Scheme'] == r['Scheme']) & (records_df['Status'] == 'Done')]
+                    if not scheme_details.empty:
+                        # 依照人名分組加總
+                        person_sum = scheme_details.groupby('Name').agg({'Hours': 'sum', 'Earnings': 'sum'}).reset_index()
+                        st.dataframe(person_sum.style.format({"Hours": "{:.2f} hr", "Earnings": "${:,.0f}"}), use_container_width=True)
+                    else:
+                        st.caption("尚無已結算薪資紀錄")
+            # ---------------------------
             st.divider()
     else:
         st.info("尚無資料，無法計算預算。")
@@ -339,7 +350,7 @@ with t3:
                 if success:
                     save_data(new_full_df)
                     st.success("✅ 資料已同步！即將重新載入...")
-                    # 這裡故意等 2 秒，確保 Google 存好資料，這樣 Rerun 後預算才會更新
+                    # 延遲 2 秒確保 Google 存檔完成，這樣重整後預算才會更新
                     time.sleep(2)
                     st.rerun()
                 else:
