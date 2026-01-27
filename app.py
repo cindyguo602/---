@@ -8,8 +8,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
-BUDGET_LIMIT = 120000
-BASE_RATE = 500
+BUDGET_LIMIT = 120000  # 預算上限
+BASE_RATE = 500        # 基礎時薪
 ADMIN_PASSWORD = "1234"
 
 # --- 核心：取得台灣時間 (解決時間不準問題) ---
@@ -139,21 +139,35 @@ def calculate_salary_stats(df):
     
     scheme_stats = []
     rate_map = {}
+    
+    # --- 關鍵邏輯：計算時薪與預算 ---
     for scheme in ['方案1', '方案2', '方案3']:
         scheme_data = records_df[(records_df['Scheme'] == scheme) & (records_df['Status'] == 'Done')]
         total_hours = scheme_data['Hours'].sum()
         
-        if total_hours * BASE_RATE > BUDGET_LIMIT:
+        # 1. 先用 500 算算看有沒有爆
+        potential_cost = total_hours * BASE_RATE
+        
+        if potential_cost > BUDGET_LIMIT:
+            # 2. 如果爆了，時薪 = 120000 / 總時數 (無條件捨去小數點後兩位，或保留精確度皆可，這裡保留運算)
             current_rate = BUDGET_LIMIT / total_hours if total_hours > 0 else BASE_RATE
-            status = "⚠️ 已達上限"
+            status = "⚠️ 已達上限 (自動降薪)"
             is_over = True
         else:
+            # 3. 沒爆就是 500
             current_rate = BASE_RATE
             status = "✅ 預算內"
             is_over = False
             
         rate_map[scheme] = current_rate
-        scheme_stats.append({'Scheme': scheme, 'Total_Hours': total_hours, 'Current_Rate': current_rate, 'Total_Spent': total_hours * current_rate, 'Status': status})
+        scheme_stats.append({
+            'Scheme': scheme, 
+            'Total_Hours': total_hours, 
+            'Current_Rate': current_rate, 
+            'Total_Spent': total_hours * current_rate, 
+            'Status': status
+        })
+    # --------------------------------
         
     records_df['Rate_Applied'] = records_df['Scheme'].map(rate_map)
     records_df['Earnings'] = records_df.apply(lambda x: x['Hours'] * x['Rate_Applied'] if x['Status'] == 'Done' else 0, axis=1)
@@ -215,7 +229,7 @@ if final_name:
                 st.rerun()
 
 st.sidebar.divider()
-st.sidebar.info(f"💰 時薪: ${BASE_RATE}\n📉 預算: ${BUDGET_LIMIT/10000}萬")
+st.sidebar.info(f"💰 基礎時薪: ${BASE_RATE}\n📉 預算上限: ${BUDGET_LIMIT/10000}萬")
 
 # --- Tabs ---
 records_df, scheme_stats_df = calculate_salary_stats(df)
@@ -259,16 +273,17 @@ with t2:
         for _,r in tgt.iterrows():
             c1,c2 = st.columns([2,1])
             c1.markdown(f"### {r['Scheme']}")
-            c2.markdown(f"時薪: **${r['Current_Rate']:.2f}**")
+            # 這裡會顯示目前的動態時薪
+            c2.markdown(f"結算時薪: **${r['Current_Rate']:.2f}**")
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
             
-            # --- [新增] 查看人員明細功能 ---
-            with st.expander(f"📋 查看 {r['Scheme']} 人員薪資詳情"):
+            # --- [這裡就是你要的：人員薪資詳情] ---
+            with st.expander(f"📋 點擊展開 {r['Scheme']} 人員薪資表"):
                 if not records_df.empty:
                     # 篩選出這個方案且已結算的紀錄
                     scheme_details = records_df[(records_df['Scheme'] == r['Scheme']) & (records_df['Status'] == 'Done')]
                     if not scheme_details.empty:
-                        # 依照人名分組加總
+                        # 依照人名分組加總，這裡的 Earnings 已經是「調整過時薪」的結果
                         person_sum = scheme_details.groupby('Name').agg({'Hours': 'sum', 'Earnings': 'sum'}).reset_index()
                         st.dataframe(person_sum.style.format({"Hours": "{:.2f} hr", "Earnings": "${:,.0f}"}), use_container_width=True)
                     else:
@@ -288,7 +303,6 @@ with t3:
         if not records_df.empty:
             w_df = records_df[records_df['Status']=='Working'].copy()
             if not w_df.empty:
-                # 改用台灣時間計算時長
                 now_ts = get_taiwan_now().timestamp()
                 w_df['時數'] = w_df['Time_In'].apply(lambda x: f"{int((now_ts-x.timestamp())//3600)}時 {int(((now_ts-x.timestamp())%3600)//60)}分")
                 w_df['打卡'] = w_df['Time_In'].dt.strftime('%H:%M')
@@ -317,7 +331,6 @@ with t3:
             filter_names = c_f1.multiselect("篩選人員", options=all_names, placeholder="留空則顯示全部")
             filter_schemes = c_f2.multiselect("篩選方案", options=all_schemes, placeholder="留空則顯示全部")
 
-        # 篩選邏輯
         mask = (df['Time'].dt.date >= start_date) & (df['Time'].dt.date <= end_date)
         if filter_names: mask = mask & (df['Name'].isin(filter_names))
         if filter_schemes: mask = mask & (df['Scheme'].isin(filter_schemes))
