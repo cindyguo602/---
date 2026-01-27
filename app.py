@@ -10,7 +10,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 SHEET_NAME = 'work_log' 
 BUDGET_LIMIT = 120000  # 預算上限
 BASE_RATE = 500        # 基礎時薪
-ADMIN_PASSWORD = "1234"
+ADMIN_PASSWORD = "345678"
 
 # --- 核心：取得台灣時間 (解決時間不準問題) ---
 def get_taiwan_now():
@@ -368,3 +368,4 @@ with t3:
                     st.rerun()
                 else:
                     st.error("❌ 時間格式錯誤！")
+
