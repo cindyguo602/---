@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import math
 import time
 import gspread
@@ -10,7 +10,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 SHEET_NAME = 'work_log' 
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "345678"
+ADMIN_PASSWORD = "1234"
+
+# --- 核心：取得台灣時間 (解決時間不準問題) ---
+def get_taiwan_now():
+    # 雲端主機通常是 UTC，所以我們要手動 +8 小時
+    return datetime.utcnow() + timedelta(hours=8)
 
 # --- 連接 Google Sheets 的函式 ---
 def get_google_sheet_client():
@@ -43,6 +48,7 @@ def save_data(df):
         sheet = client.open(SHEET_NAME).sheet1
         
         save_df = df.copy()
+        # 存檔時，確保時間轉為字串
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
         sheet.clear()
@@ -54,7 +60,9 @@ def save_data(df):
 
 def recalculate_timestamp(df):
     try:
+        # 確保格式為 datetime
         df['Time'] = pd.to_datetime(df['Time'])
+        # 重新計算 Timestamp (用來排序和計算工時)
         df['Timestamp'] = df['Time'].apply(lambda x: x.timestamp())
         return df, True
     except:
@@ -62,9 +70,14 @@ def recalculate_timestamp(df):
 
 def get_user_state(df, name):
     if df.empty: return False, None, None
-    current_time = datetime.now().timestamp()
-    user_records = df[(df['Name'] == name) & (df['Timestamp'] <= current_time + 5)].sort_values('Timestamp')
+    
+    # 改用台灣時間
+    current_time = get_taiwan_now().timestamp()
+    
+    # 稍微放寬緩衝，避免邊界時間問題
+    user_records = df[(df['Name'] == name) & (df['Timestamp'] <= current_time + 60)].sort_values('Timestamp')
     if user_records.empty: return False, None, None
+    
     last_record = user_records.iloc[-1]
     if last_record['Action'] == '上班':
         return True, last_record['Scheme'], last_record['Time']
@@ -74,9 +87,13 @@ def check_cooldown(df, name, cooldown_seconds=10):
     if df.empty: return True, 0
     user_records = df[df['Name'] == name].copy()
     if user_records.empty: return True, 0
-    current_time = datetime.now().timestamp()
+    
+    # 改用台灣時間
+    current_time = get_taiwan_now().timestamp()
+    
     valid_records = user_records[user_records['Timestamp'] <= (current_time + 5)]
     if valid_records.empty: return True, 0
+    
     last_record_time = valid_records['Timestamp'].max()
     diff = current_time - last_record_time
     if 0 <= diff < cooldown_seconds:
@@ -86,8 +103,10 @@ def check_cooldown(df, name, cooldown_seconds=10):
 def calculate_salary_stats(df):
     if df.empty: return pd.DataFrame(), pd.DataFrame()
     records = []
+    # 確保資料依照時間排序，這樣計算上班下班才不會錯亂
+    df = df.sort_values('Timestamp')
+    
     for (name, scheme), group in df.groupby(['Name', 'Scheme']):
-        group = group.sort_values('Timestamp')
         start_time = None
         for _, row in group.iterrows():
             if row['Action'] == '上班':
@@ -95,28 +114,35 @@ def calculate_salary_stats(df):
             elif row['Action'] == '下班' and start_time is not None:
                 end_time = row['Timestamp']
                 duration_seconds = end_time - start_time
-                minutes = math.ceil(duration_seconds / 60)
-                hours = minutes / 60.0
-                records.append({
-                    'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(row['Time']).date(),
-                    'Time_In': pd.to_datetime(start_time, unit='s'),
-                    'Time_Out': pd.to_datetime(end_time, unit='s'),
-                    'Minutes': minutes, 'Hours': hours, 'Status': 'Done'
-                })
+                
+                # 只有大於 0 的才算有效工時 (避免手動改時間改錯)
+                if duration_seconds > 0:
+                    minutes = math.ceil(duration_seconds / 60)
+                    hours = minutes / 60.0
+                    records.append({
+                        'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(row['Time']).date(),
+                        'Time_In': pd.to_datetime(start_time, unit='s'),
+                        'Time_Out': pd.to_datetime(end_time, unit='s'),
+                        'Minutes': minutes, 'Hours': hours, 'Status': 'Done'
+                    })
                 start_time = None 
+        
         if start_time is not None:
             records.append({
                 'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(start_time, unit='s').date(),
                 'Time_In': pd.to_datetime(start_time, unit='s'), 'Time_Out': pd.NaT,
                 'Minutes': 0, 'Hours': 0.0, 'Status': 'Working'
             })
+            
     if not records: return pd.DataFrame(), pd.DataFrame()
     records_df = pd.DataFrame(records)
+    
     scheme_stats = []
     rate_map = {}
     for scheme in ['方案1', '方案2', '方案3']:
         scheme_data = records_df[(records_df['Scheme'] == scheme) & (records_df['Status'] == 'Done')]
         total_hours = scheme_data['Hours'].sum()
+        
         if total_hours * BASE_RATE > BUDGET_LIMIT:
             current_rate = BUDGET_LIMIT / total_hours if total_hours > 0 else BASE_RATE
             status = "⚠️ 已達上限"
@@ -125,14 +151,18 @@ def calculate_salary_stats(df):
             current_rate = BASE_RATE
             status = "✅ 預算內"
             is_over = False
+            
         rate_map[scheme] = current_rate
         scheme_stats.append({'Scheme': scheme, 'Total_Hours': total_hours, 'Current_Rate': current_rate, 'Total_Spent': total_hours * current_rate, 'Status': status})
+        
     records_df['Rate_Applied'] = records_df['Scheme'].map(rate_map)
     records_df['Earnings'] = records_df.apply(lambda x: x['Hours'] * x['Rate_Applied'] if x['Status'] == 'Done' else 0, axis=1)
+    
     return records_df, pd.DataFrame(scheme_stats)
 
 def get_greeting():
-    h = datetime.now().hour
+    # 改用台灣時間
+    h = get_taiwan_now().hour
     return "早安 ☀️" if 5<=h<12 else "午安 ☕" if 12<=h<18 else "晚安 🌙"
 
 # --- 主程式 ---
@@ -156,7 +186,9 @@ final_name = st.sidebar.text_input("輸入新名字") if u_name == "➕ 新增�
 if final_name:
     is_work, cur_sch, st_time = get_user_state(df, final_name)
     st.sidebar.markdown(f"### {get_greeting()}，{final_name}！")
-    now = datetime.now()
+    
+    # 改用台灣時間
+    now = get_taiwan_now()
     
     if is_work:
         st.sidebar.success(f"🟢 工作中：**{cur_sch}**")
@@ -198,12 +230,11 @@ with t1:
             c1.metric("累計薪資", f"${my_recs['Earnings'].sum():,.0f}")
             c2.metric("結算工時", f"{my_recs[my_recs['Status']=='Done']['Hours'].sum():.2f} hr")
             
-            # --- [修正處] 這裡改成標準的 if-else，就不會印出亂碼了 ---
+            # 使用 if-else 避免亂碼
             if is_work:
                 c3.success("🟢 工作中")
             else:
                 c3.info("⚪ 已下班")
-            # ----------------------------------------------------
             
             st.write("---")
             for d in sorted(my_recs['Date'].unique(), reverse=True):
@@ -233,6 +264,8 @@ with t2:
             c2.markdown(f"時薪: **${r['Current_Rate']:.2f}**")
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
             st.divider()
+    else:
+        st.info("尚無資料，無法計算預算。")
 
 with t3:
     pwd = st.text_input("密碼", type="password")
@@ -244,7 +277,8 @@ with t3:
         if not records_df.empty:
             w_df = records_df[records_df['Status']=='Working'].copy()
             if not w_df.empty:
-                now_ts = datetime.now().timestamp()
+                # 改用台灣時間計算時長
+                now_ts = get_taiwan_now().timestamp()
                 w_df['時數'] = w_df['Time_In'].apply(lambda x: f"{int((now_ts-x.timestamp())//3600)}時 {int(((now_ts-x.timestamp())%3600)//60)}分")
                 w_df['打卡'] = w_df['Time_In'].dt.strftime('%H:%M')
                 st.dataframe(w_df[['Name','Scheme','打卡','時數']], use_container_width=True, hide_index=True)
@@ -261,8 +295,10 @@ with t3:
         with col_filter1:
             st.markdown("##### 1. 日期範圍")
             c_d1, c_d2 = st.columns(2)
+            # 預設顯示今天的資料，方便編輯
+            taiwan_today = get_taiwan_now().date()
             start_date = c_d1.date_input("開始", date(2024, 1, 1))
-            end_date = c_d2.date_input("結束", date.today())
+            end_date = c_d2.date_input("結束", taiwan_today)
 
         with col_filter2:
             st.markdown("##### 2. 詳細篩選")
@@ -295,15 +331,16 @@ with t3:
         )
 
         if st.button("💾 儲存並同步至 Google Sheet", type="primary"):
-            with st.spinner("正在寫入 Google Sheet，請稍候..."):
+            with st.spinner("正在寫入 Google Sheet..."):
                 remaining_df = df.loc[~mask]
                 new_full_df = pd.concat([remaining_df, edited_df], ignore_index=True)
                 new_full_df, success = recalculate_timestamp(new_full_df)
                 
                 if success:
                     save_data(new_full_df)
-                    st.success("✅ 資料已成功同步！")
-                    time.sleep(1)
+                    st.success("✅ 資料已同步！即將重新載入...")
+                    # 這裡故意等 2 秒，確保 Google 存好資料，這樣 Rerun 後預算才會更新
+                    time.sleep(2)
                     st.rerun()
                 else:
                     st.error("❌ 時間格式錯誤！")
