@@ -7,16 +7,13 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
-# Google Sheet 的名稱 (必須跟你雲端硬碟裡的檔名一模一樣)
 SHEET_NAME = 'work_log' 
-
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
 ADMIN_PASSWORD = "345678"
 
 # --- 連接 Google Sheets 的函式 ---
 def get_google_sheet_client():
-    # 從 Streamlit Cloud 的 Secrets 裡讀取憑證
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -31,7 +28,7 @@ def load_data():
         df = pd.DataFrame(data)
         
         if df.empty:
-            return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
+            df = pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
             
         if 'Time' in df.columns:
             df['Time'] = pd.to_datetime(df['Time'])
@@ -45,11 +42,9 @@ def save_data(df):
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
         
-        # 轉換時間格式為字串，Google Sheet 才看得懂
         save_df = df.copy()
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
-        # 清空舊資料，寫入新資料 (這是最穩的做法)
         sheet.clear()
         sheet.append_row(save_df.columns.tolist())
         sheet.append_rows(save_df.values.tolist())
@@ -202,7 +197,14 @@ with t1:
             c1,c2,c3 = st.columns(3)
             c1.metric("累計薪資", f"${my_recs['Earnings'].sum():,.0f}")
             c2.metric("結算工時", f"{my_recs[my_recs['Status']=='Done']['Hours'].sum():.2f} hr")
-            c3.success("🟢 工作中") if is_work else c3.info("⚪ 已下班")
+            
+            # --- [修正處] 這裡改成標準的 if-else，就不會印出亂碼了 ---
+            if is_work:
+                c3.success("🟢 工作中")
+            else:
+                c3.info("⚪ 已下班")
+            # ----------------------------------------------------
+            
             st.write("---")
             for d in sorted(my_recs['Date'].unique(), reverse=True):
                 st.markdown(f"#### 📅 {d}")
@@ -294,15 +296,11 @@ with t3:
 
         if st.button("💾 儲存並同步至 Google Sheet", type="primary"):
             with st.spinner("正在寫入 Google Sheet，請稍候..."):
-                # 1. 取得沒被篩選到的舊資料
                 remaining_df = df.loc[~mask]
-                # 2. 合併編輯後的資料
                 new_full_df = pd.concat([remaining_df, edited_df], ignore_index=True)
-                # 3. 重新計算 Timestamp (防止手動改時間沒改到秒數)
                 new_full_df, success = recalculate_timestamp(new_full_df)
                 
                 if success:
-                    # 4. 寫入 Google
                     save_data(new_full_df)
                     st.success("✅ 資料已成功同步！")
                     time.sleep(1)
