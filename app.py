@@ -8,15 +8,16 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
-BUDGET_LIMIT = 120000  # 預算上限
-BASE_RATE = 500        # 基礎時薪
+SUMMARY_SHEET_NAME = 'daily_summary' # 這是新分頁的名稱
+BUDGET_LIMIT = 120000
+BASE_RATE = 500
 ADMIN_PASSWORD = "1234"
 
-# --- 核心：取得台灣時間 (解決時間不準問題) ---
+# --- 核心：取得台灣時間 ---
 def get_taiwan_now():
     return datetime.utcnow() + timedelta(hours=8)
 
-# --- 連接 Google Sheets 的函式 ---
+# --- 連接 Google Sheets ---
 def get_google_sheet_client():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds_dict = dict(st.secrets["gcp_service_account"])
@@ -24,71 +25,127 @@ def get_google_sheet_client():
     client = gspread.authorize(creds)
     return client
 
+# --- 讀取資料 (防呆版) ---
 def load_data():
     try:
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
-        
-        # 改用 get_all_values 以避免標題錯誤導致崩潰
         data = sheet.get_all_values()
         
-        # 定義標準欄位
         expected_cols = ['Name', 'Scheme', 'Action', 'Time', 'Timestamp']
         df = pd.DataFrame()
         
-        # 情況 1: 試算表完全空白
         if not data:
             df = pd.DataFrame(columns=expected_cols)
-        
-        # 情況 2: 有資料，檢查標題
         else:
             headers = data[0]
-            # 如果標題不對 (缺少 Name 等關鍵欄位)，視為新表格，回傳空表
             if not set(expected_cols).issubset(set(headers)):
                 df = pd.DataFrame(columns=expected_cols)
             else:
-                # 正常讀取
                 df = pd.DataFrame(data[1:], columns=headers)
         
-        # --- [關鍵修正] 不管上面發生什麼事，這裡統一強制轉換時間格式 ---
-        # 這樣就算表格是空的，它也會變成「空的 datetime 欄位」，不會報錯
         if 'Time' in df.columns:
             df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
         
-        # 確保數值欄位是數字
         if 'Timestamp' in df.columns:
             df['Timestamp'] = pd.to_numeric(df['Timestamp'], errors='coerce')
             
         return df
-        
     except Exception as e:
         st.error(f"無法讀取 Google Sheet: {e}")
-        # 萬一連線失敗，回傳一個已經格式化好的空表格
         empty_df = pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
-        empty_df['Time'] = pd.to_datetime(empty_df['Time']) # 這裡也要轉
+        empty_df['Time'] = pd.to_datetime(empty_df['Time'])
         return empty_df
 
+# --- [新增功能] 更新「每日考勤匯總表」 ---
+def update_daily_summary_sheet(df):
+    """
+    這個函式會自動整理資料，產出一張「一人一天一行」的清楚報表
+    並寫入 Google Sheet 的第二個分頁
+    """
+    try:
+        # 1. 先算出詳細區段 (為了計算實際工時)
+        records = []
+        df = df.sort_values('Timestamp')
+        for (name, scheme), group in df.groupby(['Name', 'Scheme']):
+            start_time = None
+            for _, row in group.iterrows():
+                if row['Action'] == '上班':
+                    start_time = row['Timestamp']
+                elif row['Action'] == '下班' and start_time is not None:
+                    end_time = row['Timestamp']
+                    duration = end_time - start_time
+                    if duration > 0:
+                        records.append({
+                            'Name': name,
+                            'Date': pd.to_datetime(row['Time']).date(),
+                            'Start': pd.to_datetime(start_time, unit='s'),
+                            'End': pd.to_datetime(end_time, unit='s'),
+                            'Hours': duration / 3600
+                        })
+                    start_time = None
+        
+        if not records:
+            return # 沒資料就不處理
+
+        detail_df = pd.DataFrame(records)
+        
+        # 2. 進行匯總 (Group by Name + Date)
+        # 邏輯：取當天最早的時間當上班，最晚的時間當下班，總時數加總
+        summary_df = detail_df.groupby(['Name', 'Date']).agg(
+            最早上班=('Start', 'min'),
+            最晚下班=('End', 'max'),
+            實際工時=('Hours', 'sum')
+        ).reset_index()
+
+        # 3. 格式化顯示
+        summary_df['Date'] = summary_df['Date'].astype(str)
+        summary_df['最早上班'] = summary_df['最早上班'].dt.strftime('%H:%M:%S')
+        summary_df['最晚下班'] = summary_df['最晚下班'].dt.strftime('%H:%M:%S')
+        summary_df['實際工時'] = summary_df['實際工時'].round(2)
+        
+        # 4. 寫入 Google Sheet 的第二個分頁
+        client = get_google_sheet_client()
+        spreadsheet = client.open(SHEET_NAME)
+        
+        try:
+            worksheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
+        except:
+            # 如果分頁不存在，就建立一個新的
+            worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="5")
+        
+        worksheet.clear()
+        # 寫入中文標題
+        headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(小時)']
+        worksheet.append_row(headers)
+        worksheet.append_rows(summary_df.values.tolist())
+        
+    except Exception as e:
+        print(f"匯總表更新失敗: {e}") # 不顯示在前端以免干擾使用者，但在後台記錄
+
+# --- 存檔 (同時觸發匯總表更新) ---
 def save_data(df):
     try:
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
         
         save_df = df.copy()
-        # 存檔時，確保時間轉為字串
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
         sheet.clear()
         sheet.append_row(save_df.columns.tolist())
         sheet.append_rows(save_df.values.tolist())
         
+        # [關鍵] 存檔完後，順便更新匯總表
+        update_daily_summary_sheet(df)
+        
     except Exception as e:
         st.error(f"存檔失敗: {e}")
 
+# --- 其他輔助函式 ---
 def recalculate_timestamp(df):
     try:
-        # 確保格式為 datetime
         df['Time'] = pd.to_datetime(df['Time'])
-        # 重新計算 Timestamp
         df['Timestamp'] = df['Time'].apply(lambda x: x.timestamp())
         return df, True
     except:
@@ -96,13 +153,9 @@ def recalculate_timestamp(df):
 
 def get_user_state(df, name):
     if df.empty: return False, None, None
-    
     current_time = get_taiwan_now().timestamp()
-    
-    # 稍微放寬緩衝，避免邊界時間問題
     user_records = df[(df['Name'] == name) & (df['Timestamp'] <= current_time + 60)].sort_values('Timestamp')
     if user_records.empty: return False, None, None
-    
     last_record = user_records.iloc[-1]
     if last_record['Action'] == '上班':
         return True, last_record['Scheme'], last_record['Time']
@@ -112,12 +165,9 @@ def check_cooldown(df, name, cooldown_seconds=10):
     if df.empty: return True, 0
     user_records = df[df['Name'] == name].copy()
     if user_records.empty: return True, 0
-    
     current_time = get_taiwan_now().timestamp()
-    
     valid_records = user_records[user_records['Timestamp'] <= (current_time + 5)]
     if valid_records.empty: return True, 0
-    
     last_record_time = valid_records['Timestamp'].max()
     diff = current_time - last_record_time
     if 0 <= diff < cooldown_seconds:
@@ -127,9 +177,7 @@ def check_cooldown(df, name, cooldown_seconds=10):
 def calculate_salary_stats(df):
     if df.empty: return pd.DataFrame(), pd.DataFrame()
     records = []
-    # 確保資料依照時間排序
     df = df.sort_values('Timestamp')
-    
     for (name, scheme), group in df.groupby(['Name', 'Scheme']):
         start_time = None
         for _, row in group.iterrows():
@@ -137,61 +185,39 @@ def calculate_salary_stats(df):
                 start_time = row['Timestamp']
             elif row['Action'] == '下班' and start_time is not None:
                 end_time = row['Timestamp']
-                duration_seconds = end_time - start_time
-                
-                if duration_seconds > 0:
-                    minutes = math.ceil(duration_seconds / 60)
-                    hours = minutes / 60.0
+                duration = end_time - start_time
+                if duration > 0:
                     records.append({
                         'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(row['Time']).date(),
                         'Time_In': pd.to_datetime(start_time, unit='s'),
                         'Time_Out': pd.to_datetime(end_time, unit='s'),
-                        'Minutes': minutes, 'Hours': hours, 'Status': 'Done'
+                        'Minutes': math.ceil(duration / 60), 'Hours': duration / 3600, 'Status': 'Done'
                     })
                 start_time = None 
-        
         if start_time is not None:
             records.append({
                 'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(start_time, unit='s').date(),
                 'Time_In': pd.to_datetime(start_time, unit='s'), 'Time_Out': pd.NaT,
                 'Minutes': 0, 'Hours': 0.0, 'Status': 'Working'
             })
-            
     if not records: return pd.DataFrame(), pd.DataFrame()
     records_df = pd.DataFrame(records)
-    
     scheme_stats = []
     rate_map = {}
-    
-    # --- 關鍵邏輯：計算時薪與預算 ---
     for scheme in ['方案1', '方案2', '方案3']:
         scheme_data = records_df[(records_df['Scheme'] == scheme) & (records_df['Status'] == 'Done')]
         total_hours = scheme_data['Hours'].sum()
-        
         potential_cost = total_hours * BASE_RATE
-        
         if potential_cost > BUDGET_LIMIT:
             current_rate = BUDGET_LIMIT / total_hours if total_hours > 0 else BASE_RATE
             status = "⚠️ 已達上限 (自動降薪)"
-            is_over = True
         else:
             current_rate = BASE_RATE
             status = "✅ 預算內"
-            is_over = False
-            
         rate_map[scheme] = current_rate
-        scheme_stats.append({
-            'Scheme': scheme, 
-            'Total_Hours': total_hours, 
-            'Current_Rate': current_rate, 
-            'Total_Spent': total_hours * current_rate, 
-            'Status': status
-        })
-    # --------------------------------
-        
+        scheme_stats.append({'Scheme': scheme, 'Total_Hours': total_hours, 'Current_Rate': current_rate, 'Total_Spent': total_hours * current_rate, 'Status': status})
     records_df['Rate_Applied'] = records_df['Scheme'].map(rate_map)
     records_df['Earnings'] = records_df.apply(lambda x: x['Hours'] * x['Rate_Applied'] if x['Status'] == 'Done' else 0, axis=1)
-    
     return records_df, pd.DataFrame(scheme_stats)
 
 def get_greeting():
@@ -219,9 +245,7 @@ final_name = st.sidebar.text_input("輸入新名字") if u_name == "➕ 新增�
 if final_name:
     is_work, cur_sch, st_time = get_user_state(df, final_name)
     st.sidebar.markdown(f"### {get_greeting()}，{final_name}！")
-    
     now = get_taiwan_now()
-    
     if is_work:
         st.sidebar.success(f"🟢 工作中：**{cur_sch}**")
         st.sidebar.caption(f"開始：{st_time.strftime('%H:%M')}")
@@ -261,12 +285,8 @@ with t1:
             c1,c2,c3 = st.columns(3)
             c1.metric("累計薪資", f"${my_recs['Earnings'].sum():,.0f}")
             c2.metric("結算工時", f"{my_recs[my_recs['Status']=='Done']['Hours'].sum():.2f} hr")
-            
-            if is_work:
-                c3.success("🟢 工作中")
-            else:
-                c3.info("⚪ 已下班")
-            
+            if is_work: c3.success("🟢 工作中")
+            else: c3.info("⚪ 已下班")
             st.write("---")
             for d in sorted(my_recs['Date'].unique(), reverse=True):
                 st.markdown(f"#### 📅 {d}")
@@ -294,24 +314,20 @@ with t2:
             c1.markdown(f"### {r['Scheme']}")
             c2.markdown(f"結算時薪: **${r['Current_Rate']:.2f}**")
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
-            
             with st.expander(f"📋 點擊展開 {r['Scheme']} 人員薪資表"):
                 if not records_df.empty:
                     scheme_details = records_df[(records_df['Scheme'] == r['Scheme']) & (records_df['Status'] == 'Done')]
                     if not scheme_details.empty:
                         person_sum = scheme_details.groupby('Name').agg({'Hours': 'sum', 'Earnings': 'sum'}).reset_index()
                         st.dataframe(person_sum.style.format({"Hours": "{:.2f} hr", "Earnings": "${:,.0f}"}), use_container_width=True)
-                    else:
-                        st.caption("尚無已結算薪資紀錄")
+                    else: st.caption("尚無已結算薪資紀錄")
             st.divider()
-    else:
-        st.info("尚無資料，無法計算預算。")
+    else: st.info("尚無資料，無法計算預算。")
 
 with t3:
     pwd = st.text_input("密碼", type="password")
     if pwd == ADMIN_PASSWORD:
         st.success("已解鎖")
-        
         st.markdown("### 🟢 線上人員")
         if not records_df.empty:
             w_df = records_df[records_df['Status']=='Working'].copy()
@@ -322,35 +338,27 @@ with t3:
                 st.dataframe(w_df[['Name','Scheme','打卡','時數']], use_container_width=True, hide_index=True)
             else: st.info("無人上班")
         st.divider()
-
         st.markdown("### 📋 資料編輯 (將同步至 Google Sheet)")
-        
         col_filter1, col_filter2 = st.columns(2)
         all_names = sorted(df['Name'].unique().tolist()) if not df.empty else []
         all_schemes = ["方案1", "方案2", "方案3"]
-        
         with col_filter1:
             st.markdown("##### 1. 日期範圍")
             c_d1, c_d2 = st.columns(2)
             taiwan_today = get_taiwan_now().date()
             start_date = c_d1.date_input("開始", date(2024, 1, 1))
             end_date = c_d2.date_input("結束", taiwan_today)
-
         with col_filter2:
             st.markdown("##### 2. 詳細篩選")
             c_f1, c_f2 = st.columns(2)
             filter_names = c_f1.multiselect("篩選人員", options=all_names, placeholder="留空則顯示全部")
             filter_schemes = c_f2.multiselect("篩選方案", options=all_schemes, placeholder="留空則顯示全部")
-
-        # --- [修正處] 這裡的 .dt 不會再報錯了，因為 load_data 已經強制處理過 ---
         mask = (df['Time'].dt.date >= start_date) & (df['Time'].dt.date <= end_date)
         if filter_names: mask = mask & (df['Name'].isin(filter_names))
         if filter_schemes: mask = mask & (df['Scheme'].isin(filter_schemes))
-            
         filtered_df = df.loc[mask].copy()
         if not filtered_df.empty:
             filtered_df = filtered_df.sort_values(by=['Time', 'Name', 'Scheme'], ascending=[False, True, True])
-
         edited_df = st.data_editor(
             filtered_df,
             num_rows="dynamic",
@@ -364,17 +372,14 @@ with t3:
             },
             key="admin_editor"
         )
-
         if st.button("💾 儲存並同步至 Google Sheet", type="primary"):
             with st.spinner("正在寫入 Google Sheet..."):
                 remaining_df = df.loc[~mask]
                 new_full_df = pd.concat([remaining_df, edited_df], ignore_index=True)
                 new_full_df, success = recalculate_timestamp(new_full_df)
-                
                 if success:
                     save_data(new_full_df)
                     st.success("✅ 資料已同步！即將重新載入...")
                     time.sleep(2)
                     st.rerun()
-                else:
-                    st.error("❌ 時間格式錯誤！")
+                else: st.error("❌ 時間格式錯誤！")
