@@ -9,10 +9,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
 SUMMARY_SHEET_NAME = 'daily_summary' # 報表
-HISTORY_SHEET_NAME = 'raw_history'   # [新] 永遠不會被覆蓋的黑盒子
+HISTORY_SHEET_NAME = 'raw_history'   # 黑盒子
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "1234"
+ADMIN_PASSWORD = "345678"
 
 # --- 核心：取得台灣時間 ---
 def get_taiwan_now():
@@ -55,50 +55,35 @@ def load_data():
         st.error(f"無法讀取 Google Sheet: {e}")
         return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
 
-# --- [新功能] 黑盒子紀錄 (永遠不准刪除) ---
+# --- 黑盒子紀錄 (永遠不准刪除) ---
 def log_raw_history(name, scheme, action, time_obj):
-    """
-    這是一張永遠不會被 'clear' 的表。
-    不管前台後台怎麼改，這裡永遠記錄當下按鈕按下去的那一刻。
-    """
     try:
         client = get_google_sheet_client()
         spreadsheet = client.open(SHEET_NAME)
-        
-        # 嘗試取得 raw_history 分頁，沒有就建立
         try:
             worksheet = spreadsheet.worksheet(HISTORY_SHEET_NAME)
         except:
             worksheet = spreadsheet.add_worksheet(title=HISTORY_SHEET_NAME, rows="5000", cols="6")
             worksheet.append_row(['記錄時間(台灣)', '姓名', '方案', '動作', '系統秒數', '備註'])
 
-        # 準備資料
         taiwan_time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
         row = [taiwan_time_str, name, scheme, action, str(time_obj.timestamp()), '原始打卡']
-        
-        # 直接追加到最後一行 (Append Only)
         worksheet.append_row(row)
-        
     except Exception as e:
         print(f"黑盒子寫入失敗: {e}")
 
-# --- 安全追加紀錄 (Work Log) ---
+# --- 安全追加紀錄 ---
 def append_record_safely(name, scheme, action, time_obj):
     try:
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
-        
         row = [
             name, scheme, action,
             time_obj.strftime('%Y-%m-%d %H:%M:%S'),
             time_obj.timestamp()
         ]
-        
         sheet.append_row(row)
-        
-        # [關鍵] 同時寫入黑盒子
         log_raw_history(name, scheme, action, time_obj)
-        
         return True
     except Exception as e:
         st.error(f"打卡寫入失敗: {e}")
@@ -109,24 +94,15 @@ def save_data_overwrite(df):
     if df.empty:
         st.error("⚠️ 資料異常空白，阻止覆蓋！")
         return False
-
     try:
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
-        
         save_df = df.copy()
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        
         sheet.clear()
         sheet.append_row(save_df.columns.tolist())
         sheet.append_rows(save_df.values.tolist())
-        
-        # 更新報表
         update_daily_summary_sheet(df)
-        
-        # 注意：這裡故意不更新 raw_history，因為這是「修改後」的結果
-        # raw_history 只保留「原始」的紀錄，這樣才有據可查
-        
         return True
     except Exception as e:
         st.error(f"存檔失敗: {e}")
@@ -137,7 +113,6 @@ def update_daily_summary_sheet(df):
     try:
         records = []
         df = df.sort_values('Timestamp')
-        
         for (name, scheme), group in df.groupby(['Name', 'Scheme']):
             start_work = None
             start_rest = None
@@ -145,7 +120,6 @@ def update_daily_summary_sheet(df):
                 action = row['Action']
                 ts = row['Timestamp']
                 dt = pd.to_datetime(row['Time']).date()
-                
                 if action == '上班':
                     start_work = ts
                     if start_rest is not None:
@@ -174,7 +148,6 @@ def update_daily_summary_sheet(df):
 
         if not records: return
         detail_df = pd.DataFrame(records)
-        
         summary_df = detail_df.groupby(['Name', 'Date']).agg(
             最早上班=('Start', 'min'),
             最晚下班=('End', 'max'),
@@ -192,17 +165,13 @@ def update_daily_summary_sheet(df):
         
         client = get_google_sheet_client()
         spreadsheet = client.open(SHEET_NAME)
-        
-        try:
-            worksheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
-        except:
-            worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="6")
+        try: worksheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
+        except: worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="6")
         
         worksheet.clear()
         headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(hr)', '休息時間(hr)']
         worksheet.append_row(headers)
         worksheet.append_rows(final_df.values.tolist())
-        
     except Exception as e:
         print(f"匯總表更新失敗: {e}")
 
@@ -438,15 +407,45 @@ with t3:
     pwd = st.text_input("密碼", type="password")
     if pwd == ADMIN_PASSWORD:
         st.success("已解鎖")
-        st.markdown("### 🟢 線上人員")
-        if not records_df.empty:
-            w_df = records_df[records_df['Status']=='Working'].copy()
-            if not w_df.empty:
-                now_ts = get_taiwan_now().timestamp()
-                w_df['時數'] = w_df['Time_In'].apply(lambda x: f"{int((now_ts-x.timestamp())//3600)}時 {int(((now_ts-x.timestamp())%3600)//60)}分")
-                w_df['打卡'] = w_df['Time_In'].dt.strftime('%H:%M')
-                st.dataframe(w_df[['Name','Scheme','打卡','時數']], use_container_width=True, hide_index=True)
-            else: st.info("無人上班")
+        
+        # --- [重點更新] 即時監控面板 (顯示上班與休息) ---
+        st.markdown("### 🟢 即時現場狀況")
+        
+        # 掃描所有人的最新狀態
+        status_list = []
+        if not df.empty:
+            all_names = df['Name'].unique().tolist()
+            now_ts = get_taiwan_now().timestamp()
+            
+            for name in all_names:
+                user_state, user_sch, user_time = get_user_state(df, name)
+                
+                if user_state in ['WORKING', 'RESTING']:
+                    # 計算持續時間
+                    duration_sec = now_ts - user_time.timestamp()
+                    hours = int(duration_sec // 3600)
+                    mins = int((duration_sec % 3600) // 60)
+                    duration_str = f"{hours}時 {mins}分"
+                    
+                    status_list.append({
+                        '姓名': name,
+                        '狀態': '🟢 工作中' if user_state == 'WORKING' else '☕ 休息中',
+                        '方案': user_sch,
+                        '開始時間': user_time.strftime('%H:%M'),
+                        '持續時間': duration_str,
+                        '排序': 1 if user_state == 'WORKING' else 2 # 工作排上面，休息排下面
+                    })
+        
+        if status_list:
+            status_df = pd.DataFrame(status_list).sort_values('排序')
+            st.dataframe(
+                status_df[['姓名', '狀態', '方案', '開始時間', '持續時間']], 
+                use_container_width=True, 
+                hide_index=True
+            )
+        else:
+            st.info("目前現場無人 (皆已下班)")
+        
         st.divider()
         st.markdown("### 📋 資料編輯 (僅限管理員)")
         col_filter1, col_filter2 = st.columns(2)
