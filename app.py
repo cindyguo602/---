@@ -14,7 +14,6 @@ ADMIN_PASSWORD = "1234"
 
 # --- 核心：取得台灣時間 (解決時間不準問題) ---
 def get_taiwan_now():
-    # 雲端主機通常是 UTC，所以我們要手動 +8 小時
     return datetime.utcnow() + timedelta(hours=8)
 
 # --- 連接 Google Sheets 的函式 ---
@@ -35,35 +34,39 @@ def load_data():
         
         # 定義標準欄位
         expected_cols = ['Name', 'Scheme', 'Action', 'Time', 'Timestamp']
+        df = pd.DataFrame()
         
         # 情況 1: 試算表完全空白
         if not data:
-            return pd.DataFrame(columns=expected_cols)
-            
-        # 取得第一列當作標題
-        headers = data[0]
+            df = pd.DataFrame(columns=expected_cols)
         
-        # 情況 2: 標題列不正確 (缺少 Name 或其他必要欄位)
-        # 這是解決 KeyError 的關鍵：如果標題不對，就強制回傳空的標準表格，讓程式能跑
-        if not set(expected_cols).issubset(set(headers)):
-            return pd.DataFrame(columns=expected_cols)
-            
-        # 情況 3: 正常讀取 (排除第一列標題)
-        df = pd.DataFrame(data[1:], columns=headers)
+        # 情況 2: 有資料，檢查標題
+        else:
+            headers = data[0]
+            # 如果標題不對 (缺少 Name 等關鍵欄位)，視為新表格，回傳空表
+            if not set(expected_cols).issubset(set(headers)):
+                df = pd.DataFrame(columns=expected_cols)
+            else:
+                # 正常讀取
+                df = pd.DataFrame(data[1:], columns=headers)
         
+        # --- [關鍵修正] 不管上面發生什麼事，這裡統一強制轉換時間格式 ---
+        # 這樣就算表格是空的，它也會變成「空的 datetime 欄位」，不會報錯
         if 'Time' in df.columns:
             df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
         
-        # 確保數值欄位是數字 (防呆)
+        # 確保數值欄位是數字
         if 'Timestamp' in df.columns:
             df['Timestamp'] = pd.to_numeric(df['Timestamp'], errors='coerce')
             
         return df
         
     except Exception as e:
-        # 萬一連線失敗，回傳空表格防止網頁掛掉
         st.error(f"無法讀取 Google Sheet: {e}")
-        return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
+        # 萬一連線失敗，回傳一個已經格式化好的空表格
+        empty_df = pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
+        empty_df['Time'] = pd.to_datetime(empty_df['Time']) # 這裡也要轉
+        return empty_df
 
 def save_data(df):
     try:
@@ -85,7 +88,7 @@ def recalculate_timestamp(df):
     try:
         # 確保格式為 datetime
         df['Time'] = pd.to_datetime(df['Time'])
-        # 重新計算 Timestamp (用來排序和計算工時)
+        # 重新計算 Timestamp
         df['Timestamp'] = df['Time'].apply(lambda x: x.timestamp())
         return df, True
     except:
@@ -94,7 +97,6 @@ def recalculate_timestamp(df):
 def get_user_state(df, name):
     if df.empty: return False, None, None
     
-    # 改用台灣時間
     current_time = get_taiwan_now().timestamp()
     
     # 稍微放寬緩衝，避免邊界時間問題
@@ -111,7 +113,6 @@ def check_cooldown(df, name, cooldown_seconds=10):
     user_records = df[df['Name'] == name].copy()
     if user_records.empty: return True, 0
     
-    # 改用台灣時間
     current_time = get_taiwan_now().timestamp()
     
     valid_records = user_records[user_records['Timestamp'] <= (current_time + 5)]
@@ -138,7 +139,6 @@ def calculate_salary_stats(df):
                 end_time = row['Timestamp']
                 duration_seconds = end_time - start_time
                 
-                # 只有大於 0 的才算有效工時
                 if duration_seconds > 0:
                     minutes = math.ceil(duration_seconds / 60)
                     hours = minutes / 60.0
@@ -168,16 +168,13 @@ def calculate_salary_stats(df):
         scheme_data = records_df[(records_df['Scheme'] == scheme) & (records_df['Status'] == 'Done')]
         total_hours = scheme_data['Hours'].sum()
         
-        # 1. 先用 500 算算看有沒有爆
         potential_cost = total_hours * BASE_RATE
         
         if potential_cost > BUDGET_LIMIT:
-            # 2. 如果爆了，時薪 = 120000 / 總時數 (無條件捨去小數點後兩位，或保留精確度皆可，這裡保留運算)
             current_rate = BUDGET_LIMIT / total_hours if total_hours > 0 else BASE_RATE
             status = "⚠️ 已達上限 (自動降薪)"
             is_over = True
         else:
-            # 3. 沒爆就是 500
             current_rate = BASE_RATE
             status = "✅ 預算內"
             is_over = False
@@ -223,7 +220,6 @@ if final_name:
     is_work, cur_sch, st_time = get_user_state(df, final_name)
     st.sidebar.markdown(f"### {get_greeting()}，{final_name}！")
     
-    # 改用台灣時間
     now = get_taiwan_now()
     
     if is_work:
@@ -296,22 +292,17 @@ with t2:
         for _,r in tgt.iterrows():
             c1,c2 = st.columns([2,1])
             c1.markdown(f"### {r['Scheme']}")
-            # 這裡會顯示目前的動態時薪
             c2.markdown(f"結算時薪: **${r['Current_Rate']:.2f}**")
             st.progress(min(r['Total_Spent']/BUDGET_LIMIT, 1.0), f"消耗: ${r['Total_Spent']:,.0f} / ${BUDGET_LIMIT:,.0f}")
             
-            # --- [這裡就是你要的：人員薪資詳情] ---
             with st.expander(f"📋 點擊展開 {r['Scheme']} 人員薪資表"):
                 if not records_df.empty:
-                    # 篩選出這個方案且已結算的紀錄
                     scheme_details = records_df[(records_df['Scheme'] == r['Scheme']) & (records_df['Status'] == 'Done')]
                     if not scheme_details.empty:
-                        # 依照人名分組加總，這裡的 Earnings 已經是「調整過時薪」的結果
                         person_sum = scheme_details.groupby('Name').agg({'Hours': 'sum', 'Earnings': 'sum'}).reset_index()
                         st.dataframe(person_sum.style.format({"Hours": "{:.2f} hr", "Earnings": "${:,.0f}"}), use_container_width=True)
                     else:
                         st.caption("尚無已結算薪資紀錄")
-            # ---------------------------
             st.divider()
     else:
         st.info("尚無資料，無法計算預算。")
@@ -321,7 +312,6 @@ with t3:
     if pwd == ADMIN_PASSWORD:
         st.success("已解鎖")
         
-        # --- 1. 即時監控 ---
         st.markdown("### 🟢 線上人員")
         if not records_df.empty:
             w_df = records_df[records_df['Status']=='Working'].copy()
@@ -333,7 +323,6 @@ with t3:
             else: st.info("無人上班")
         st.divider()
 
-        # --- 2. Google 同步編輯器 ---
         st.markdown("### 📋 資料編輯 (將同步至 Google Sheet)")
         
         col_filter1, col_filter2 = st.columns(2)
@@ -343,7 +332,6 @@ with t3:
         with col_filter1:
             st.markdown("##### 1. 日期範圍")
             c_d1, c_d2 = st.columns(2)
-            # 預設顯示今天的資料，方便編輯
             taiwan_today = get_taiwan_now().date()
             start_date = c_d1.date_input("開始", date(2024, 1, 1))
             end_date = c_d2.date_input("結束", taiwan_today)
@@ -354,6 +342,7 @@ with t3:
             filter_names = c_f1.multiselect("篩選人員", options=all_names, placeholder="留空則顯示全部")
             filter_schemes = c_f2.multiselect("篩選方案", options=all_schemes, placeholder="留空則顯示全部")
 
+        # --- [修正處] 這裡的 .dt 不會再報錯了，因為 load_data 已經強制處理過 ---
         mask = (df['Time'].dt.date >= start_date) & (df['Time'].dt.date <= end_date)
         if filter_names: mask = mask & (df['Name'].isin(filter_names))
         if filter_schemes: mask = mask & (df['Scheme'].isin(filter_schemes))
@@ -362,7 +351,6 @@ with t3:
         if not filtered_df.empty:
             filtered_df = filtered_df.sort_values(by=['Time', 'Name', 'Scheme'], ascending=[False, True, True])
 
-        # 編輯器
         edited_df = st.data_editor(
             filtered_df,
             num_rows="dynamic",
@@ -386,7 +374,6 @@ with t3:
                 if success:
                     save_data(new_full_df)
                     st.success("✅ 資料已同步！即將重新載入...")
-                    # 延遲 2 秒確保 Google 存檔完成，這樣重整後預算才會更新
                     time.sleep(2)
                     st.rerun()
                 else:
