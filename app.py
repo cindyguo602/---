@@ -11,7 +11,7 @@ SHEET_NAME = 'work_log'
 SUMMARY_SHEET_NAME = 'daily_summary' # 這是新分頁的名稱
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "1234"
+ADMIN_PASSWORD = "345678"
 
 # --- 核心：取得台灣時間 ---
 def get_taiwan_now():
@@ -383,3 +383,4 @@ with t3:
                     time.sleep(2)
                     st.rerun()
                 else: st.error("❌ 時間格式錯誤！")
+
