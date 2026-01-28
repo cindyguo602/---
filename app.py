@@ -8,10 +8,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
-SUMMARY_SHEET_NAME = 'daily_summary'
+SUMMARY_SHEET_NAME = 'daily_summary' # 報表
+HISTORY_SHEET_NAME = 'raw_history'   # [新] 永遠不會被覆蓋的黑盒子
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "345678"
+ADMIN_PASSWORD = "1234"
 
 # --- 核心：取得台灣時間 ---
 def get_taiwan_now():
@@ -52,86 +53,128 @@ def load_data():
         return df
     except Exception as e:
         st.error(f"無法讀取 Google Sheet: {e}")
-        empty_df = pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
-        empty_df['Time'] = pd.to_datetime(empty_df['Time'])
-        return empty_df
+        return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
 
-# --- [核心修改] 更新每日考勤表 (含休息時間計算) ---
+# --- [新功能] 黑盒子紀錄 (永遠不准刪除) ---
+def log_raw_history(name, scheme, action, time_obj):
+    """
+    這是一張永遠不會被 'clear' 的表。
+    不管前台後台怎麼改，這裡永遠記錄當下按鈕按下去的那一刻。
+    """
+    try:
+        client = get_google_sheet_client()
+        spreadsheet = client.open(SHEET_NAME)
+        
+        # 嘗試取得 raw_history 分頁，沒有就建立
+        try:
+            worksheet = spreadsheet.worksheet(HISTORY_SHEET_NAME)
+        except:
+            worksheet = spreadsheet.add_worksheet(title=HISTORY_SHEET_NAME, rows="5000", cols="6")
+            worksheet.append_row(['記錄時間(台灣)', '姓名', '方案', '動作', '系統秒數', '備註'])
+
+        # 準備資料
+        taiwan_time_str = time_obj.strftime('%Y-%m-%d %H:%M:%S')
+        row = [taiwan_time_str, name, scheme, action, str(time_obj.timestamp()), '原始打卡']
+        
+        # 直接追加到最後一行 (Append Only)
+        worksheet.append_row(row)
+        
+    except Exception as e:
+        print(f"黑盒子寫入失敗: {e}")
+
+# --- 安全追加紀錄 (Work Log) ---
+def append_record_safely(name, scheme, action, time_obj):
+    try:
+        client = get_google_sheet_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        
+        row = [
+            name, scheme, action,
+            time_obj.strftime('%Y-%m-%d %H:%M:%S'),
+            time_obj.timestamp()
+        ]
+        
+        sheet.append_row(row)
+        
+        # [關鍵] 同時寫入黑盒子
+        log_raw_history(name, scheme, action, time_obj)
+        
+        return True
+    except Exception as e:
+        st.error(f"打卡寫入失敗: {e}")
+        return False
+
+# --- 全量存檔 (管理員用) ---
+def save_data_overwrite(df):
+    if df.empty:
+        st.error("⚠️ 資料異常空白，阻止覆蓋！")
+        return False
+
+    try:
+        client = get_google_sheet_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        
+        save_df = df.copy()
+        save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        sheet.clear()
+        sheet.append_row(save_df.columns.tolist())
+        sheet.append_rows(save_df.values.tolist())
+        
+        # 更新報表
+        update_daily_summary_sheet(df)
+        
+        # 注意：這裡故意不更新 raw_history，因為這是「修改後」的結果
+        # raw_history 只保留「原始」的紀錄，這樣才有據可查
+        
+        return True
+    except Exception as e:
+        st.error(f"存檔失敗: {e}")
+        return False
+
+# --- 更新每日考勤表 ---
 def update_daily_summary_sheet(df):
     try:
         records = []
         df = df.sort_values('Timestamp')
         
-        # 針對每個人進行分析
         for (name, scheme), group in df.groupby(['Name', 'Scheme']):
-            start_work = None # 上班開始時間
-            start_rest = None # 休息開始時間
-            
+            start_work = None
+            start_rest = None
             for _, row in group.iterrows():
                 action = row['Action']
                 ts = row['Timestamp']
                 dt = pd.to_datetime(row['Time']).date()
                 
                 if action == '上班':
-                    # 1. 新的工時開始
                     start_work = ts
-                    
-                    # 2. 如果之前在休息，現在回來上班 -> 結算休息時間
                     if start_rest is not None:
                         rest_seconds = ts - start_rest
                         if rest_seconds > 0:
-                            records.append({
-                                'Name': name, 'Date': dt, 
-                                'WorkSeconds': 0, 'RestSeconds': rest_seconds,
-                                'Start': pd.NaT, 'End': pd.NaT 
-                            })
-                        start_rest = None # 休息結束
-                        
+                            records.append({'Name': name, 'Date': dt, 'WorkSeconds': 0, 'RestSeconds': rest_seconds, 'Start': pd.NaT, 'End': pd.NaT})
+                        start_rest = None
                 elif action == '休息':
-                    # 1. 之前在上班 -> 結算工時
                     if start_work is not None:
                         work_seconds = ts - start_work
                         if work_seconds > 0:
-                            records.append({
-                                'Name': name, 'Date': dt, 
-                                'WorkSeconds': work_seconds, 'RestSeconds': 0,
-                                'Start': pd.to_datetime(start_work, unit='s'), 
-                                'End': pd.to_datetime(ts, unit='s')
-                            })
-                        start_work = None # 工時結束
-                    
-                    # 2. 開始休息計時
-                    start_rest = ts
-                    
-                elif action == '下班':
-                    # 1. 之前在上班 -> 結算工時
-                    if start_work is not None:
-                        work_seconds = ts - start_work
-                        if work_seconds > 0:
-                            records.append({
-                                'Name': name, 'Date': dt, 
-                                'WorkSeconds': work_seconds, 'RestSeconds': 0,
-                                'Start': pd.to_datetime(start_work, unit='s'), 
-                                'End': pd.to_datetime(ts, unit='s')
-                            })
+                            records.append({'Name': name, 'Date': dt, 'WorkSeconds': work_seconds, 'RestSeconds': 0, 'Start': pd.to_datetime(start_work, unit='s'), 'End': pd.to_datetime(ts, unit='s')})
                         start_work = None
-                        
-                    # 2. 之前在休息 -> 結算休息時間 (休息完直接下班)
+                    start_rest = ts
+                elif action == '下班':
+                    if start_work is not None:
+                        work_seconds = ts - start_work
+                        if work_seconds > 0:
+                            records.append({'Name': name, 'Date': dt, 'WorkSeconds': work_seconds, 'RestSeconds': 0, 'Start': pd.to_datetime(start_work, unit='s'), 'End': pd.to_datetime(ts, unit='s')})
+                        start_work = None
                     if start_rest is not None:
                         rest_seconds = ts - start_rest
                         if rest_seconds > 0:
-                            records.append({
-                                'Name': name, 'Date': dt, 
-                                'WorkSeconds': 0, 'RestSeconds': rest_seconds,
-                                'Start': pd.NaT, 'End': pd.NaT 
-                            })
+                            records.append({'Name': name, 'Date': dt, 'WorkSeconds': 0, 'RestSeconds': rest_seconds, 'Start': pd.NaT, 'End': pd.NaT})
                         start_rest = None
 
         if not records: return
-
         detail_df = pd.DataFrame(records)
         
-        # 匯總邏輯：算出當天「總工時」和「總休息時間」
         summary_df = detail_df.groupby(['Name', 'Date']).agg(
             最早上班=('Start', 'min'),
             最晚下班=('End', 'max'),
@@ -139,14 +182,12 @@ def update_daily_summary_sheet(df):
             總休息秒=('RestSeconds', 'sum')
         ).reset_index()
 
-        # 格式化輸出
         summary_df['Date'] = summary_df['Date'].astype(str)
         summary_df['最早上班'] = summary_df['最早上班'].dt.strftime('%H:%M:%S').fillna('')
         summary_df['最晚下班'] = summary_df['最晚下班'].dt.strftime('%H:%M:%S').fillna('')
         summary_df['實際工時'] = (summary_df['總工時秒'] / 3600).round(2)
         summary_df['休息時間'] = (summary_df['總休息秒'] / 3600).round(2)
         
-        # 準備寫入 Google Sheet
         final_df = summary_df[['Name', 'Date', '最早上班', '最晚下班', '實際工時', '休息時間']]
         
         client = get_google_sheet_client()
@@ -165,24 +206,6 @@ def update_daily_summary_sheet(df):
     except Exception as e:
         print(f"匯總表更新失敗: {e}")
 
-# --- 存檔函式 ---
-def save_data(df):
-    try:
-        client = get_google_sheet_client()
-        sheet = client.open(SHEET_NAME).sheet1
-        
-        save_df = df.copy()
-        save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        
-        sheet.clear()
-        sheet.append_row(save_df.columns.tolist())
-        sheet.append_rows(save_df.values.tolist())
-        
-        update_daily_summary_sheet(df)
-        
-    except Exception as e:
-        st.error(f"存檔失敗: {e}")
-
 def recalculate_timestamp(df):
     try:
         df['Time'] = pd.to_datetime(df['Time'])
@@ -195,17 +218,11 @@ def get_user_state(df, name):
     if df.empty: return 'OFF', None, None
     current_time = get_taiwan_now().timestamp()
     user_records = df[(df['Name'] == name) & (df['Timestamp'] <= current_time + 60)].sort_values('Timestamp')
-    
     if user_records.empty: return 'OFF', None, None
-    
     last_record = user_records.iloc[-1]
-    
-    if last_record['Action'] == '上班':
-        return 'WORKING', last_record['Scheme'], last_record['Time']
-    elif last_record['Action'] == '休息':
-        return 'RESTING', last_record['Scheme'], last_record['Time']
-    else:
-        return 'OFF', None, None
+    if last_record['Action'] == '上班': return 'WORKING', last_record['Scheme'], last_record['Time']
+    elif last_record['Action'] == '休息': return 'RESTING', last_record['Scheme'], last_record['Time']
+    else: return 'OFF', None, None
 
 def check_cooldown(df, name, cooldown_seconds=10):
     if df.empty: return True, 0
@@ -216,8 +233,7 @@ def check_cooldown(df, name, cooldown_seconds=10):
     if valid_records.empty: return True, 0
     last_record_time = valid_records['Timestamp'].max()
     diff = current_time - last_record_time
-    if 0 <= diff < cooldown_seconds:
-        return False, int(cooldown_seconds - diff)
+    if 0 <= diff < cooldown_seconds: return False, int(cooldown_seconds - diff)
     return True, 0
 
 def calculate_salary_stats(df):
@@ -301,20 +317,24 @@ if final_name:
              ok, wait = check_cooldown(df, final_name)
              if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
              else:
-                new_row = pd.DataFrame([{'Name': final_name, 'Scheme': cur_sch, 'Action': '休息', 'Time': now, 'Timestamp': now.timestamp()}])
-                save_data(pd.concat([df, new_row], ignore_index=True))
-                st.session_state['show_balloons'] = True
-                time.sleep(1)
-                st.rerun()
+                success = append_record_safely(final_name, cur_sch, '休息', now)
+                if success:
+                    st.session_state['show_balloons'] = True
+                    new_df = load_data() 
+                    update_daily_summary_sheet(new_df)
+                    time.sleep(1)
+                    st.rerun()
         if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
             else:
-                new_row = pd.DataFrame([{'Name': final_name, 'Scheme': cur_sch, 'Action': '下班', 'Time': now, 'Timestamp': now.timestamp()}])
-                save_data(pd.concat([df, new_row], ignore_index=True))
-                st.session_state['show_balloons'] = True
-                time.sleep(1)
-                st.rerun()
+                success = append_record_safely(final_name, cur_sch, '下班', now)
+                if success:
+                    st.session_state['show_balloons'] = True
+                    new_df = load_data()
+                    update_daily_summary_sheet(new_df)
+                    time.sleep(1)
+                    st.rerun()
 
     elif state == 'RESTING':
         st.sidebar.warning(f"☕ 休息中：**{cur_sch}**")
@@ -324,20 +344,24 @@ if final_name:
              ok, wait = check_cooldown(df, final_name)
              if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
              else:
-                new_row = pd.DataFrame([{'Name': final_name, 'Scheme': cur_sch, 'Action': '上班', 'Time': now, 'Timestamp': now.timestamp()}])
-                save_data(pd.concat([df, new_row], ignore_index=True))
-                st.session_state['show_balloons'] = True
-                time.sleep(1)
-                st.rerun()
+                success = append_record_safely(final_name, cur_sch, '上班', now)
+                if success:
+                    st.session_state['show_balloons'] = True
+                    new_df = load_data()
+                    update_daily_summary_sheet(new_df)
+                    time.sleep(1)
+                    st.rerun()
         if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
             else:
-                new_row = pd.DataFrame([{'Name': final_name, 'Scheme': cur_sch, 'Action': '下班', 'Time': now, 'Timestamp': now.timestamp()}])
-                save_data(pd.concat([df, new_row], ignore_index=True))
-                st.session_state['show_balloons'] = True
-                time.sleep(1)
-                st.rerun()
+                success = append_record_safely(final_name, cur_sch, '下班', now)
+                if success:
+                    st.session_state['show_balloons'] = True
+                    new_df = load_data()
+                    update_daily_summary_sheet(new_df)
+                    time.sleep(1)
+                    st.rerun()
 
     else:
         st.sidebar.info("⚪ 目前狀態：已下班")
@@ -346,11 +370,13 @@ if final_name:
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
             else:
-                new_row = pd.DataFrame([{'Name': final_name, 'Scheme': sch_opt, 'Action': '上班', 'Time': now, 'Timestamp': now.timestamp()}])
-                save_data(pd.concat([df, new_row], ignore_index=True))
-                st.session_state['show_balloons'] = True
-                time.sleep(1)
-                st.rerun()
+                success = append_record_safely(final_name, sch_opt, '上班', now)
+                if success:
+                    st.session_state['show_balloons'] = True
+                    new_df = load_data()
+                    update_daily_summary_sheet(new_df)
+                    time.sleep(1)
+                    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.info(f"💰 基礎時薪: ${BASE_RATE}\n📉 預算上限: ${BUDGET_LIMIT/10000}萬")
@@ -422,7 +448,7 @@ with t3:
                 st.dataframe(w_df[['Name','Scheme','打卡','時數']], use_container_width=True, hide_index=True)
             else: st.info("無人上班")
         st.divider()
-        st.markdown("### 📋 資料編輯 (將同步至 Google Sheet)")
+        st.markdown("### 📋 資料編輯 (僅限管理員)")
         col_filter1, col_filter2 = st.columns(2)
         all_names = sorted(df['Name'].unique().tolist()) if not df.empty else []
         all_schemes = ["方案1", "方案2", "方案3"]
@@ -456,14 +482,15 @@ with t3:
             },
             key="admin_editor"
         )
-        if st.button("💾 儲存並同步至 Google Sheet", type="primary"):
+        if st.button("💾 儲存 (覆蓋模式)", type="primary"):
             with st.spinner("正在寫入 Google Sheet..."):
                 remaining_df = df.loc[~mask]
                 new_full_df = pd.concat([remaining_df, edited_df], ignore_index=True)
                 new_full_df, success = recalculate_timestamp(new_full_df)
                 if success:
-                    save_data(new_full_df)
-                    st.success("✅ 資料已同步！即將重新載入...")
-                    time.sleep(2)
-                    st.rerun()
+                    result = save_data_overwrite(new_full_df)
+                    if result:
+                        st.success("✅ 資料已同步！即將重新載入...")
+                        time.sleep(2)
+                        st.rerun()
                 else: st.error("❌ 時間格式錯誤！")
