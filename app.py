@@ -8,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
-SUMMARY_SHEET_NAME = 'daily_summary' # 👈 這裡就是那張乾淨總表的名字
+SUMMARY_SHEET_NAME = 'daily_summary'
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
 ADMIN_PASSWORD = "345678"
@@ -56,75 +56,111 @@ def load_data():
         empty_df['Time'] = pd.to_datetime(empty_df['Time'])
         return empty_df
 
-# --- [關鍵功能] 自動更新「每日考勤匯總表」 ---
+# --- [核心修改] 更新每日考勤表 (含休息時間計算) ---
 def update_daily_summary_sheet(df):
-    """
-    這個函式負責把「很亂的流水帳」整理成「乾淨的一人一行」
-    """
     try:
         records = []
-        # 依照時間排序，確保邏輯正確
         df = df.sort_values('Timestamp')
         
-        # 1. 計算每個人的「有效工時片段」
+        # 針對每個人進行分析
         for (name, scheme), group in df.groupby(['Name', 'Scheme']):
-            start_time = None
+            start_work = None # 上班開始時間
+            start_rest = None # 休息開始時間
+            
             for _, row in group.iterrows():
-                if row['Action'] == '上班':
-                    start_time = row['Timestamp']
+                action = row['Action']
+                ts = row['Timestamp']
+                dt = pd.to_datetime(row['Time']).date()
                 
-                # 遇到「下班」或「休息」，都算是一段工作的結束
-                elif row['Action'] in ['下班', '休息'] and start_time is not None:
-                    end_time = row['Timestamp']
-                    duration = end_time - start_time
+                if action == '上班':
+                    # 1. 新的工時開始
+                    start_work = ts
                     
-                    # 只有大於0的時間才算
-                    if duration > 0:
-                        records.append({
-                            'Name': name,
-                            'Date': pd.to_datetime(row['Time']).date(),
-                            'Start': pd.to_datetime(start_time, unit='s'),
-                            'End': pd.to_datetime(end_time, unit='s'),
-                            'Hours': duration / 3600 # 轉成小時
-                        })
-                    start_time = None # 重置開始時間 (休息時 start_time 為 None，不會計時)
-        
+                    # 2. 如果之前在休息，現在回來上班 -> 結算休息時間
+                    if start_rest is not None:
+                        rest_seconds = ts - start_rest
+                        if rest_seconds > 0:
+                            records.append({
+                                'Name': name, 'Date': dt, 
+                                'WorkSeconds': 0, 'RestSeconds': rest_seconds,
+                                'Start': pd.NaT, 'End': pd.NaT 
+                            })
+                        start_rest = None # 休息結束
+                        
+                elif action == '休息':
+                    # 1. 之前在上班 -> 結算工時
+                    if start_work is not None:
+                        work_seconds = ts - start_work
+                        if work_seconds > 0:
+                            records.append({
+                                'Name': name, 'Date': dt, 
+                                'WorkSeconds': work_seconds, 'RestSeconds': 0,
+                                'Start': pd.to_datetime(start_work, unit='s'), 
+                                'End': pd.to_datetime(ts, unit='s')
+                            })
+                        start_work = None # 工時結束
+                    
+                    # 2. 開始休息計時
+                    start_rest = ts
+                    
+                elif action == '下班':
+                    # 1. 之前在上班 -> 結算工時
+                    if start_work is not None:
+                        work_seconds = ts - start_work
+                        if work_seconds > 0:
+                            records.append({
+                                'Name': name, 'Date': dt, 
+                                'WorkSeconds': work_seconds, 'RestSeconds': 0,
+                                'Start': pd.to_datetime(start_work, unit='s'), 
+                                'End': pd.to_datetime(ts, unit='s')
+                            })
+                        start_work = None
+                        
+                    # 2. 之前在休息 -> 結算休息時間 (休息完直接下班)
+                    if start_rest is not None:
+                        rest_seconds = ts - start_rest
+                        if rest_seconds > 0:
+                            records.append({
+                                'Name': name, 'Date': dt, 
+                                'WorkSeconds': 0, 'RestSeconds': rest_seconds,
+                                'Start': pd.NaT, 'End': pd.NaT 
+                            })
+                        start_rest = None
+
         if not records: return
 
         detail_df = pd.DataFrame(records)
         
-        # 2. 進行「每日匯總」 (Group by Name + Date)
-        # 取當天最早的打卡當作「上班時間」
-        # 取當天最晚的紀錄當作「下班時間」
-        # 把所有片段的 Hours 加總，就是「實際工時」(已自動扣除休息時間)
+        # 匯總邏輯：算出當天「總工時」和「總休息時間」
         summary_df = detail_df.groupby(['Name', 'Date']).agg(
             最早上班=('Start', 'min'),
             最晚下班=('End', 'max'),
-            實際工時=('Hours', 'sum')
+            總工時秒=('WorkSeconds', 'sum'),
+            總休息秒=('RestSeconds', 'sum')
         ).reset_index()
 
-        # 3. 格式化 (讓 Excel 看起來漂亮)
+        # 格式化輸出
         summary_df['Date'] = summary_df['Date'].astype(str)
-        summary_df['最早上班'] = summary_df['最早上班'].dt.strftime('%H:%M:%S')
-        summary_df['最晚下班'] = summary_df['最晚下班'].dt.strftime('%H:%M:%S')
-        summary_df['實際工時'] = summary_df['實際工時'].round(2) # 小數點兩位
+        summary_df['最早上班'] = summary_df['最早上班'].dt.strftime('%H:%M:%S').fillna('')
+        summary_df['最晚下班'] = summary_df['最晚下班'].dt.strftime('%H:%M:%S').fillna('')
+        summary_df['實際工時'] = (summary_df['總工時秒'] / 3600).round(2)
+        summary_df['休息時間'] = (summary_df['總休息秒'] / 3600).round(2)
         
-        # 4. 寫入 Sheet 2 (daily_summary)
+        # 準備寫入 Google Sheet
+        final_df = summary_df[['Name', 'Date', '最早上班', '最晚下班', '實際工時', '休息時間']]
+        
         client = get_google_sheet_client()
         spreadsheet = client.open(SHEET_NAME)
         
         try:
-            # 嘗試開啟第二個分頁
             worksheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
         except:
-            # 如果沒有，就新增一個
-            worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="5")
+            worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="6")
         
-        # 清空舊資料，重新寫入整齊的表
         worksheet.clear()
-        headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(休息已扣除)']
+        headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(hr)', '休息時間(hr)']
         worksheet.append_row(headers)
-        worksheet.append_rows(summary_df.values.tolist())
+        worksheet.append_rows(final_df.values.tolist())
         
     except Exception as e:
         print(f"匯總表更新失敗: {e}")
@@ -138,12 +174,10 @@ def save_data(df):
         save_df = df.copy()
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
-        # 1. 寫入流水帳 (Sheet 1)
         sheet.clear()
         sheet.append_row(save_df.columns.tolist())
         sheet.append_rows(save_df.values.tolist())
         
-        # 2. 同步更新乾淨總表 (Sheet 2)
         update_daily_summary_sheet(df)
         
     except Exception as e:
@@ -259,11 +293,9 @@ if final_name:
     st.sidebar.markdown(f"### {get_greeting()}，{final_name}！")
     now = get_taiwan_now()
     
-    # 狀態顯示與按鈕邏輯
     if state == 'WORKING':
         st.sidebar.success(f"🟢 工作中：**{cur_sch}**")
         st.sidebar.caption(f"開始：{st_time.strftime('%H:%M')}")
-        
         c1, c2 = st.sidebar.columns(2)
         if c1.button("⏸️ 暫停(休息)", use_container_width=True):
              ok, wait = check_cooldown(df, final_name)
@@ -274,7 +306,6 @@ if final_name:
                 st.session_state['show_balloons'] = True
                 time.sleep(1)
                 st.rerun()
-        
         if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
@@ -288,7 +319,6 @@ if final_name:
     elif state == 'RESTING':
         st.sidebar.warning(f"☕ 休息中：**{cur_sch}**")
         st.sidebar.caption(f"休息開始：{st_time.strftime('%H:%M')}")
-        
         c1, c2 = st.sidebar.columns(2)
         if c1.button("▶️ 繼續工作", use_container_width=True):
              ok, wait = check_cooldown(df, final_name)
@@ -299,7 +329,6 @@ if final_name:
                 st.session_state['show_balloons'] = True
                 time.sleep(1)
                 st.rerun()
-
         if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
@@ -438,4 +467,3 @@ with t3:
                     time.sleep(2)
                     st.rerun()
                 else: st.error("❌ 時間格式錯誤！")
-
