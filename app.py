@@ -29,16 +29,39 @@ def load_data():
     try:
         client = get_google_sheet_client()
         sheet = client.open(SHEET_NAME).sheet1
-        data = sheet.get_all_records()
-        df = pd.DataFrame(data)
         
-        if df.empty:
-            df = pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
+        # 改用 get_all_values 以避免標題錯誤導致崩潰
+        data = sheet.get_all_values()
+        
+        # 定義標準欄位
+        expected_cols = ['Name', 'Scheme', 'Action', 'Time', 'Timestamp']
+        
+        # 情況 1: 試算表完全空白
+        if not data:
+            return pd.DataFrame(columns=expected_cols)
             
+        # 取得第一列當作標題
+        headers = data[0]
+        
+        # 情況 2: 標題列不正確 (缺少 Name 或其他必要欄位)
+        # 這是解決 KeyError 的關鍵：如果標題不對，就強制回傳空的標準表格，讓程式能跑
+        if not set(expected_cols).issubset(set(headers)):
+            return pd.DataFrame(columns=expected_cols)
+            
+        # 情況 3: 正常讀取 (排除第一列標題)
+        df = pd.DataFrame(data[1:], columns=headers)
+        
         if 'Time' in df.columns:
-            df['Time'] = pd.to_datetime(df['Time'])
+            df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+        
+        # 確保數值欄位是數字 (防呆)
+        if 'Timestamp' in df.columns:
+            df['Timestamp'] = pd.to_numeric(df['Timestamp'], errors='coerce')
+            
         return df
+        
     except Exception as e:
+        # 萬一連線失敗，回傳空表格防止網頁掛掉
         st.error(f"無法讀取 Google Sheet: {e}")
         return pd.DataFrame(columns=['Name', 'Scheme', 'Action', 'Time', 'Timestamp'])
 
