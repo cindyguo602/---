@@ -8,10 +8,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定檔 ---
 SHEET_NAME = 'work_log' 
-SUMMARY_SHEET_NAME = 'daily_summary'
+SUMMARY_SHEET_NAME = 'daily_summary' # 👈 這裡就是那張乾淨總表的名字
 BUDGET_LIMIT = 120000
 BASE_RATE = 500
-ADMIN_PASSWORD = "345678"
+ADMIN_PASSWORD = "1234"
 
 # --- 核心：取得台灣時間 ---
 def get_taiwan_now():
@@ -56,62 +56,80 @@ def load_data():
         empty_df['Time'] = pd.to_datetime(empty_df['Time'])
         return empty_df
 
-# --- 更新每日考勤表 (支援休息邏輯) ---
+# --- [關鍵功能] 自動更新「每日考勤匯總表」 ---
 def update_daily_summary_sheet(df):
+    """
+    這個函式負責把「很亂的流水帳」整理成「乾淨的一人一行」
+    """
     try:
         records = []
+        # 依照時間排序，確保邏輯正確
         df = df.sort_values('Timestamp')
+        
+        # 1. 計算每個人的「有效工時片段」
         for (name, scheme), group in df.groupby(['Name', 'Scheme']):
             start_time = None
             for _, row in group.iterrows():
                 if row['Action'] == '上班':
                     start_time = row['Timestamp']
-                # [關鍵修改] 遇到「下班」或「休息」都算一段工作的結束
+                
+                # 遇到「下班」或「休息」，都算是一段工作的結束
                 elif row['Action'] in ['下班', '休息'] and start_time is not None:
                     end_time = row['Timestamp']
                     duration = end_time - start_time
+                    
+                    # 只有大於0的時間才算
                     if duration > 0:
                         records.append({
                             'Name': name,
                             'Date': pd.to_datetime(row['Time']).date(),
                             'Start': pd.to_datetime(start_time, unit='s'),
                             'End': pd.to_datetime(end_time, unit='s'),
-                            'Hours': duration / 3600
+                            'Hours': duration / 3600 # 轉成小時
                         })
-                    start_time = None
+                    start_time = None # 重置開始時間 (休息時 start_time 為 None，不會計時)
         
         if not records: return
 
         detail_df = pd.DataFrame(records)
         
-        # 匯總邏輯：算出當天「最早打卡」和「最晚離開」，以及「累積工時」
+        # 2. 進行「每日匯總」 (Group by Name + Date)
+        # 取當天最早的打卡當作「上班時間」
+        # 取當天最晚的紀錄當作「下班時間」
+        # 把所有片段的 Hours 加總，就是「實際工時」(已自動扣除休息時間)
         summary_df = detail_df.groupby(['Name', 'Date']).agg(
             最早上班=('Start', 'min'),
             最晚下班=('End', 'max'),
             實際工時=('Hours', 'sum')
         ).reset_index()
 
+        # 3. 格式化 (讓 Excel 看起來漂亮)
         summary_df['Date'] = summary_df['Date'].astype(str)
         summary_df['最早上班'] = summary_df['最早上班'].dt.strftime('%H:%M:%S')
         summary_df['最晚下班'] = summary_df['最晚下班'].dt.strftime('%H:%M:%S')
-        summary_df['實際工時'] = summary_df['實際工時'].round(2)
+        summary_df['實際工時'] = summary_df['實際工時'].round(2) # 小數點兩位
         
+        # 4. 寫入 Sheet 2 (daily_summary)
         client = get_google_sheet_client()
         spreadsheet = client.open(SHEET_NAME)
         
         try:
+            # 嘗試開啟第二個分頁
             worksheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
         except:
+            # 如果沒有，就新增一個
             worksheet = spreadsheet.add_worksheet(title=SUMMARY_SHEET_NAME, rows="1000", cols="5")
         
+        # 清空舊資料，重新寫入整齊的表
         worksheet.clear()
-        headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(小時)']
+        headers = ['姓名', '日期', '上班時間', '下班時間', '實際工時(休息已扣除)']
         worksheet.append_row(headers)
         worksheet.append_rows(summary_df.values.tolist())
         
     except Exception as e:
         print(f"匯總表更新失敗: {e}")
 
+# --- 存檔函式 ---
 def save_data(df):
     try:
         client = get_google_sheet_client()
@@ -120,10 +138,12 @@ def save_data(df):
         save_df = df.copy()
         save_df['Time'] = save_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
         
+        # 1. 寫入流水帳 (Sheet 1)
         sheet.clear()
         sheet.append_row(save_df.columns.tolist())
         sheet.append_rows(save_df.values.tolist())
         
+        # 2. 同步更新乾淨總表 (Sheet 2)
         update_daily_summary_sheet(df)
         
     except Exception as e:
@@ -137,10 +157,8 @@ def recalculate_timestamp(df):
     except:
         return df, False
 
-# --- [關鍵修改] 判斷狀態 (上班中 vs 休息中) ---
 def get_user_state(df, name):
     if df.empty: return 'OFF', None, None
-    
     current_time = get_taiwan_now().timestamp()
     user_records = df[(df['Name'] == name) & (df['Timestamp'] <= current_time + 60)].sort_values('Timestamp')
     
@@ -177,7 +195,6 @@ def calculate_salary_stats(df):
         for _, row in group.iterrows():
             if row['Action'] == '上班':
                 start_time = row['Timestamp']
-            # [關鍵修改] 下班或休息都算結束計時
             elif row['Action'] in ['下班', '休息'] and start_time is not None:
                 end_time = row['Timestamp']
                 duration = end_time - start_time
@@ -189,18 +206,14 @@ def calculate_salary_stats(df):
                         'Minutes': math.ceil(duration / 60), 'Hours': duration / 3600, 'Status': 'Done'
                     })
                 start_time = None 
-        
-        # 處理還在工作中的狀況 (不處理休息中的，因為休息中不計時)
         if start_time is not None:
             records.append({
                 'Name': name, 'Scheme': scheme, 'Date': pd.to_datetime(start_time, unit='s').date(),
                 'Time_In': pd.to_datetime(start_time, unit='s'), 'Time_Out': pd.NaT,
                 'Minutes': 0, 'Hours': 0.0, 'Status': 'Working'
             })
-            
     if not records: return pd.DataFrame(), pd.DataFrame()
     records_df = pd.DataFrame(records)
-    
     scheme_stats = []
     rate_map = {}
     for scheme in ['方案1', '方案2', '方案3']:
@@ -215,10 +228,8 @@ def calculate_salary_stats(df):
             status = "✅ 預算內"
         rate_map[scheme] = current_rate
         scheme_stats.append({'Scheme': scheme, 'Total_Hours': total_hours, 'Current_Rate': current_rate, 'Total_Spent': total_hours * current_rate, 'Status': status})
-    
     records_df['Rate_Applied'] = records_df['Scheme'].map(rate_map)
     records_df['Earnings'] = records_df.apply(lambda x: x['Hours'] * x['Rate_Applied'] if x['Status'] == 'Done' else 0, axis=1)
-    
     return records_df, pd.DataFrame(scheme_stats)
 
 def get_greeting():
@@ -248,16 +259,13 @@ if final_name:
     st.sidebar.markdown(f"### {get_greeting()}，{final_name}！")
     now = get_taiwan_now()
     
-    # --- [狀態邏輯大升級] ---
+    # 狀態顯示與按鈕邏輯
     if state == 'WORKING':
         st.sidebar.success(f"🟢 工作中：**{cur_sch}**")
         st.sidebar.caption(f"開始：{st_time.strftime('%H:%M')}")
         
-        # 兩個按鈕：暫停 OR 下班
-        col_btn1, col_btn2 = st.sidebar.columns(2)
-        
-        # 1. 暫停按鈕
-        if col_btn1.button("⏸️ 暫停(休息)", use_container_width=True):
+        c1, c2 = st.sidebar.columns(2)
+        if c1.button("⏸️ 暫停(休息)", use_container_width=True):
              ok, wait = check_cooldown(df, final_name)
              if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
              else:
@@ -267,8 +275,7 @@ if final_name:
                 time.sleep(1)
                 st.rerun()
         
-        # 2. 下班按鈕
-        if col_btn2.button("⏹️ 下班", use_container_width=True, type="primary"):
+        if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
             else:
@@ -282,11 +289,8 @@ if final_name:
         st.sidebar.warning(f"☕ 休息中：**{cur_sch}**")
         st.sidebar.caption(f"休息開始：{st_time.strftime('%H:%M')}")
         
-        # 兩個按鈕：繼續 OR 下班
-        col_btn1, col_btn2 = st.sidebar.columns(2)
-        
-        # 1. 繼續工作
-        if col_btn1.button("▶️ 繼續工作", use_container_width=True):
+        c1, c2 = st.sidebar.columns(2)
+        if c1.button("▶️ 繼續工作", use_container_width=True):
              ok, wait = check_cooldown(df, final_name)
              if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
              else:
@@ -296,8 +300,7 @@ if final_name:
                 time.sleep(1)
                 st.rerun()
 
-        # 2. 直接下班 (萬一休息完就走了)
-        if col_btn2.button("⏹️ 下班", use_container_width=True, type="primary"):
+        if c2.button("⏹️ 下班", use_container_width=True, type="primary"):
             ok, wait = check_cooldown(df, final_name)
             if not ok: st.sidebar.error(f"太快了，等 {wait} 秒")
             else:
@@ -307,8 +310,8 @@ if final_name:
                 time.sleep(1)
                 st.rerun()
 
-    else: # OFF
-        st.sidebar.info("⚪ 目前狀態：已下班/休息")
+    else:
+        st.sidebar.info("⚪ 目前狀態：已下班")
         sch_opt = st.sidebar.selectbox("方案", ["方案1", "方案2", "方案3"])
         if st.sidebar.button("▶️ 上班打卡", use_container_width=True):
             ok, wait = check_cooldown(df, final_name)
@@ -435,4 +438,3 @@ with t3:
                     time.sleep(2)
                     st.rerun()
                 else: st.error("❌ 時間格式錯誤！")
-
